@@ -1624,6 +1624,8 @@ public enum FfiStartupMode {
     )
     case coldStart(scannedCount: UInt64
     )
+    case failed(message: String
+    )
 }
 
 
@@ -1647,6 +1649,9 @@ public struct FfiConverterTypeFfiStartupMode: FfiConverterRustBuffer {
         case 2: return .coldStart(scannedCount: try FfiConverterUInt64.read(from: &buf)
         )
         
+        case 3: return .failed(message: try FfiConverterString.read(from: &buf)
+        )
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -1664,6 +1669,11 @@ public struct FfiConverterTypeFfiStartupMode: FfiConverterRustBuffer {
             writeInt(&buf, Int32(2))
             FfiConverterUInt64.write(scannedCount, into: &buf)
             
+
+        case let .failed(message):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(message, into: &buf)
+
         }
     }
 }

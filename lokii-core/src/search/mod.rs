@@ -1,10 +1,30 @@
 pub mod fuzzy;
-pub mod substring;
-pub mod wildcard;
 pub mod regex_search;
+pub mod substring;
+pub mod top_k;
+pub mod wildcard;
 
+use crate::compact_index::CompactIndex;
 use crate::indexer::{FileEntry, IndexStore};
 use serde::Serialize;
+
+use top_k::{Candidate, TopK};
+
+/// Rank every indexed name by `score` (higher is better, `None` excludes the
+/// entry) and return the best `max_results`, ordered by score then name.
+pub(crate) fn rank_names<'a, K: Ord>(
+    index: &'a CompactIndex,
+    max_results: usize,
+    mut score: impl FnMut(&'a str) -> Option<K>,
+) -> Vec<Candidate<'a, K>> {
+    let mut top = TopK::new(max_results);
+    for (id, name) in index.names() {
+        if let Some(score) = score(name) {
+            top.offer(id.0, score, name);
+        }
+    }
+    top.finish()
+}
 
 /// Search mode per D-01, D-02, D-04.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -74,9 +94,7 @@ pub fn dispatch(
             let results = wildcard::search(store, query, max_results);
             (results, None)
         }
-        SearchMode::Regex => {
-            regex_search::search(store, query, max_results)
-        }
+        SearchMode::Regex => regex_search::search(store, query, max_results),
         SearchMode::Fuzzy => {
             let results = fuzzy::search(store, query, max_results);
             (results, None)
@@ -263,7 +281,13 @@ mod tests {
             search_mode: SearchMode::Substring,
         };
         let json = serde_json::to_string(&result).unwrap();
-        assert!(json.contains("matchPositions"), "should have camelCase matchPositions");
-        assert!(json.contains("searchMode"), "should have camelCase searchMode");
+        assert!(
+            json.contains("matchPositions"),
+            "should have camelCase matchPositions"
+        );
+        assert!(
+            json.contains("searchMode"),
+            "should have camelCase searchMode"
+        );
     }
 }

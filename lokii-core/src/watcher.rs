@@ -80,12 +80,12 @@ pub struct EventBatch {
 pub fn classify_events(raw: HashMap<PathBuf, Vec<EventKind>>) -> EventBatch {
     let mut batch = EventBatch::default();
     for (path, kinds) in raw {
-        let has_rename_from = kinds.iter().any(|k| {
-            matches!(k, EventKind::Modify(ModifyKind::Name(RenameMode::From)))
-        });
-        let has_rename_to = kinds.iter().any(|k| {
-            matches!(k, EventKind::Modify(ModifyKind::Name(RenameMode::To)))
-        });
+        let has_rename_from = kinds
+            .iter()
+            .any(|k| matches!(k, EventKind::Modify(ModifyKind::Name(RenameMode::From))));
+        let has_rename_to = kinds
+            .iter()
+            .any(|k| matches!(k, EventKind::Modify(ModifyKind::Name(RenameMode::To))));
         let has_create = kinds.iter().any(|k| matches!(k, EventKind::Create(_)));
         let has_remove = kinds.iter().any(|k| matches!(k, EventKind::Remove(_)));
 
@@ -130,12 +130,14 @@ fn detect_dir_renames(
     }
 
     // Check which removes had children in the index (were directories we knew about)
-    let entries = store.entries();
+    let entries = store.read();
     let dir_removes: Vec<&PathBuf> = removes
         .iter()
         .filter(|r| {
             let prefix = format!("{}/", r.to_string_lossy());
-            entries.iter().any(|e| e.path.starts_with(&prefix))
+            entries
+                .iter()
+                .any(|(_, view)| view.path_starts_with(&prefix))
         })
         .collect();
     drop(entries); // Drop read lock before any write lock (Pitfall 3)
@@ -159,137 +161,49 @@ fn detect_dir_renames(
     renames
 }
 
-/// Bulk path prefix rewrite for directory renames using entries_mut().
-/// Updates the directory entry itself and all children whose path starts with old_prefix + "/".
-/// Uses "/" boundary guard to avoid /foo/bar matching /foo/barista (Pitfall 4).
-/// Returns the number of entries updated.
-fn apply_dir_rename(store: &IndexStore, old_prefix: &str, new_prefix: &str) -> usize {
-    let search_prefix = format!("{}/", old_prefix);
-    let mut entries = store.entries_mut();
-    let mut count = 0;
-
-    for entry in entries.iter_mut() {
-        // Update the directory entry itself
-        if entry.path == old_prefix {
-            entry.path = new_prefix.to_string();
-            if let Some(name) = Path::new(new_prefix).file_name() {
-                entry.name = name.to_string_lossy().into_owned();
-            }
-            count += 1;
-        }
-        // Update child entries (use "/" suffix to avoid /foo/bar matching /foo/barista)
-        else if entry.path.starts_with(&search_prefix) {
-            entry.path = format!("{}/{}", new_prefix, &entry.path[search_prefix.len()..]);
-            count += 1;
-        }
-    }
-
-    count
-}
-
-/// Process a classified event batch: build FileEntry structs OUTSIDE the lock,
-/// then apply incremental updates to the IndexStore (per D-07).
-/// Uses upsert semantics for creates: removes existing entries with the same path
-/// before adding, to avoid duplicates when FSEvents delivers modify events for
-/// files already in the index.
-/// Detects directory renames and bulk-rewrites child paths before normal processing.
-/// Returns the number of entries added and removed.
 pub fn process_event_batch(
-    mut batch: EventBatch,
+    batch: EventBatch,
     store: &IndexStore,
     filter: &CompiledFilter,
     include_hidden: bool,
 ) -> (usize, usize) {
-    // --- Directory rename detection (before normal create/remove processing) ---
-    let dir_renames = detect_dir_renames(&batch.creates, &batch.removes, store);
+    try_process_event_batch(batch, store, filter, include_hidden).unwrap_or_else(|error| {
+        eprintln!("[Lokii] index update failed: {error}");
+        (0, 0)
+    })
+}
 
-    for (old_path, new_path) in &dir_renames {
-        // Bulk-rewrite child paths in the index
-        apply_dir_rename(store, old_path, new_path);
-
-        // Remove matched pairs from batch to avoid double-processing
-        batch.removes.retain(|p| p.to_string_lossy() != *old_path);
-        batch.creates.retain(|p| p.to_string_lossy() != *new_path);
-
-        // Check if new path should be excluded — if so, remove all rewritten entries
-        if filter.is_excluded(Path::new(new_path)) {
-            let remove_prefix = format!("{}/", new_path);
-            let paths_to_remove: HashSet<String> = {
-                let entries = store.entries();
-                entries
-                    .iter()
-                    .filter(|e| e.path == *new_path || e.path.starts_with(&remove_prefix))
-                    .map(|e| e.path.clone())
-                    .collect()
-            };
-            if !paths_to_remove.is_empty() {
-                store.remove_paths(&paths_to_remove);
-            }
-        }
+fn try_process_event_batch(
+    mut batch: EventBatch,
+    store: &IndexStore,
+    filter: &CompiledFilter,
+    include_hidden: bool,
+) -> Result<(usize, usize), crate::compact_index::IndexError> {
+    let renames = detect_dir_renames(&batch.creates, &batch.removes, store);
+    let excluded_renames: Vec<_> = renames
+        .iter()
+        .filter(|(_, new)| filter.is_excluded(Path::new(new)))
+        .map(|(_, new)| new.clone())
+        .collect();
+    for (old, new) in &renames {
+        batch.removes.retain(|path| path.to_string_lossy() != *old);
+        batch.creates.retain(|path| path.to_string_lossy() != *new);
     }
-
-    // Filter and build new entries OUTSIDE the lock (per D-07)
-    let new_entries: Vec<FileEntry> = batch
+    let creates: Vec<_> = batch
         .creates
         .iter()
-        .filter(|p| !filter.is_excluded(p))
-        .filter(|p| include_hidden || !is_hidden(p))
-        .filter_map(|p| file_entry_from_path(p))
+        .filter(|path| !filter.is_excluded(path))
+        .filter(|path| include_hidden || !is_hidden(path))
+        .filter_map(|path| file_entry_from_path(path))
         .collect();
-
-    // Build removal set: explicit removes + paths being upserted (to avoid duplicates)
-    let mut remove_set: HashSet<String> = batch
+    let remove_roots: Vec<String> = batch
         .removes
         .iter()
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|path| path.to_string_lossy().into_owned())
         .collect();
-
-    // Cascade: for each remove path, also remove all child entries in the index.
-    // This handles the case where a directory rename's detect_dir_renames() pairing
-    // fails (unpaired From event), so the directory remove correctly cleans up
-    // all descendant entries instead of leaving them as orphans.
-    {
-        let entries = store.entries();
-        let mut cascade_paths: Vec<String> = Vec::new();
-        for remove_path in &remove_set.clone() {
-            let prefix = format!("{}/", remove_path);
-            for entry in entries.iter() {
-                if entry.path.starts_with(&prefix) {
-                    cascade_paths.push(entry.path.clone());
-                }
-            }
-        }
-        drop(entries);
-        for p in cascade_paths {
-            remove_set.insert(p);
-        }
-    }
-
-    // Add create paths to removal set for upsert semantics
-    for entry in &new_entries {
-        remove_set.insert(entry.path.clone());
-    }
-
-    let added = new_entries.len();
-
-    // Count and perform actual removals
-    let removed = if remove_set.is_empty() {
-        0
-    } else {
-        let current = store.entries();
-        let count = current.iter().filter(|e| remove_set.contains(&e.path)).count();
-        drop(current); // Drop read lock before write (Pitfall 5)
-        if count > 0 {
-            store.remove_paths(&remove_set);
-        }
-        count
-    };
-
-    if !new_entries.is_empty() {
-        store.add_entries(new_entries);
-    }
-
-    (added, removed)
+    store
+        .write()
+        .apply_event_batch(&renames, &excluded_renames, &remove_roots, creates)
 }
 
 // ── Dirty Queue: Coalescing ────────────────────────────────────────────────
@@ -335,19 +249,17 @@ impl DirtyQueue {
             }
         }
 
-        let is_dir = matches!(kind, EventKind::Create(notify::event::CreateKind::Folder))
-            || path.is_dir();
+        let is_dir =
+            matches!(kind, EventKind::Create(notify::event::CreateKind::Folder)) || path.is_dir();
 
         if is_dir {
             self.dir_paths.insert(path.clone());
             // Remove any existing children of this directory (now covered by dir rescan)
             let prefix = format!("{}/", path.to_string_lossy());
-            self.paths.retain(|p, _| {
-                !p.starts_with(&prefix) && p != &path
-            });
-            self.dir_paths.retain(|p| {
-                p == &path || !p.starts_with(&prefix)
-            });
+            self.paths
+                .retain(|p, _| !p.starts_with(&prefix) && p != &path);
+            self.dir_paths
+                .retain(|p| p == &path || !p.starts_with(&prefix));
         }
 
         self.paths.entry(path).or_default().push(kind);
@@ -400,7 +312,11 @@ fn collect_safe_watch_paths(
     out.push(path.to_path_buf());
 }
 
-fn safe_watch_paths(paths: &[PathBuf], filter: &CompiledFilter, protected: &[PathBuf]) -> Vec<PathBuf> {
+fn safe_watch_paths(
+    paths: &[PathBuf],
+    filter: &CompiledFilter,
+    protected: &[PathBuf],
+) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for path in paths {
         collect_safe_watch_paths(path, filter, protected, &mut out);
@@ -456,7 +372,9 @@ where
                     // Level 1: fast filter at callback top level.
                     // Excluded events never enter the channel or debounce queue.
                     if event.paths.iter().all(|p| filter.is_excluded(p)) {
-                        metrics.events_dropped_excluded.fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .events_dropped_excluded
+                            .fetch_add(1, Ordering::Relaxed);
                         return;
                     }
 
@@ -510,7 +428,8 @@ where
                     ) {
                         if event.paths.len() >= 2 {
                             let old_path = event.paths[0].clone();
-                            if has_fda || !scanner::is_protected_or_descendant(&old_path, &protected)
+                            if has_fda
+                                || !scanner::is_protected_or_descendant(&old_path, &protected)
                             {
                                 dirty.insert(
                                     old_path,
@@ -519,7 +438,8 @@ where
                             }
 
                             let new_path = event.paths[1].clone();
-                            if has_fda || !scanner::is_protected_or_descendant(&new_path, &protected)
+                            if has_fda
+                                || !scanner::is_protected_or_descendant(&new_path, &protected)
                             {
                                 dirty.insert(
                                     new_path,
@@ -529,7 +449,7 @@ where
                             handled_as_both = true;
                         }
                     }
-                    
+
                     if !handled_as_both {
                         // Accumulate all event kinds per path (with coalescing)
                         for path in event.paths {
@@ -553,8 +473,13 @@ where
                 if !dirty.is_empty() {
                     let raw = dirty.take();
                     let batch = classify_events(raw);
-                    let (_added, _removed) =
-                        process_event_batch(batch, &store, &filter, include_hidden);
+                    if let Err(error) =
+                        try_process_event_batch(batch, &store, &filter, include_hidden)
+                    {
+                        eprintln!("[Lokii] index event batch failed: {error}");
+                        first_event_time = None;
+                        continue;
+                    }
                     metrics.batches_processed.fetch_add(1, Ordering::Relaxed);
                     let new_total = store.len();
                     on_batch(new_total);
@@ -590,43 +515,20 @@ pub fn start_reconciliation_timer<S, D>(
             let paths = config.resolve_paths();
             let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let filter = Arc::new(CompiledFilter::from_config(&config));
-            let fresh = scanner::scan_directories(
-                &paths,
-                filter,
-                config.index.include_hidden,
-                progress,
-            );
-
-            // Build diff (per D-09)
-            let fresh_set: HashSet<String> = fresh.iter().map(|e| e.path.clone()).collect();
-            let current = store.entries();
-            let current_set: HashSet<String> = current.iter().map(|e| e.path.clone()).collect();
-
-            let added: Vec<FileEntry> = fresh
-                .into_iter()
-                .filter(|e| !current_set.contains(&e.path))
-                .collect();
-            let removed: HashSet<String> = current_set
-                .into_iter()
-                .filter(|p| !fresh_set.contains(p))
-                .collect();
-
-            drop(current); // Release read lock before write (Pitfall 5)
-
-            if !added.is_empty() || !removed.is_empty() {
-                if !removed.is_empty() {
-                    store.remove_paths(&removed);
+            match scanner::scan_compact(&paths, filter, config.index.include_hidden, progress) {
+                Ok(fresh) => {
+                    let reconciled = store.write().reconcile(&fresh);
+                    match reconciled {
+                        Ok(()) => {
+                            let cache_file = AppConfig::config_dir().join("index.cache");
+                            let entries = store.read();
+                            let _ = cache::save_compact(&entries, &cache_file);
+                        }
+                        Err(error) => eprintln!("[Lokii] reconciliation failed: {error}"),
+                    }
                 }
-                if !added.is_empty() {
-                    store.add_entries(added);
-                }
+                Err(error) => eprintln!("[Lokii] reconciliation scan failed: {error}"),
             }
-
-            // Save cache after reconciliation
-            let cache_file = AppConfig::config_dir().join("index.cache");
-            let entries = store.entries();
-            let _ = cache::save_cache(&entries, &cache_file);
-            drop(entries);
 
             let new_total = store.len();
             on_done(new_total);
@@ -644,7 +546,6 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    
     // --- is_hidden tests ---
 
     #[test]
@@ -750,10 +651,7 @@ mod tests {
         fs::write(&file_path, "data").unwrap();
 
         let mut raw = HashMap::new();
-        raw.insert(
-            file_path,
-            vec![EventKind::Modify(ModifyKind::Any)],
-        );
+        raw.insert(file_path, vec![EventKind::Modify(ModifyKind::Any)]);
         let batch = classify_events(raw);
         assert_eq!(batch.creates.len(), 1);
         assert_eq!(batch.removes.len(), 0);
@@ -862,8 +760,7 @@ mod tests {
             removes: vec![],
         };
 
-        let (added, _removed) =
-            process_event_batch(batch, &store, &dummy_filter(), true);
+        let (added, _removed) = process_event_batch(batch, &store, &dummy_filter(), true);
         assert_eq!(added, 0);
         assert_eq!(store.len(), 0);
     }
@@ -907,7 +804,11 @@ mod tests {
     // --- directory rename tests ---
 
     /// Helper to create a FileEntry for tests (mirrors indexer::tests::make_entry pattern)
-    fn dummy_filter() -> crate::filter::CompiledFilter { let mut cfg = crate::config::AppConfig::default(); cfg.index.index_paths = vec![]; crate::filter::CompiledFilter::from_config(&cfg) }
+    fn dummy_filter() -> crate::filter::CompiledFilter {
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.index.index_paths = vec![];
+        crate::filter::CompiledFilter::from_config(&cfg)
+    }
 
     fn make_entry(name: &str, path: &str, is_dir: bool) -> FileEntry {
         let extension = if is_dir {
@@ -961,11 +862,15 @@ mod tests {
             "Directory entry should have new path"
         );
         assert!(
-            entries.iter().any(|e| e.path == format!("{}/a.txt", new_prefix)),
+            entries
+                .iter()
+                .any(|e| e.path == format!("{}/a.txt", new_prefix)),
             "Child a.txt should have new prefix"
         );
         assert!(
-            entries.iter().any(|e| e.path == format!("{}/sub/b.txt", new_prefix)),
+            entries
+                .iter()
+                .any(|e| e.path == format!("{}/sub/b.txt", new_prefix)),
             "Child b.txt should have new prefix"
         );
         assert!(
@@ -1035,7 +940,9 @@ mod tests {
 
         let entries = store.entries();
         assert!(
-            entries.iter().any(|e| e.path == format!("{}/b/c/file.txt", new_prefix)),
+            entries
+                .iter()
+                .any(|e| e.path == format!("{}/b/c/file.txt", new_prefix)),
             "Deeply nested file should have updated path"
         );
         assert!(
@@ -1110,7 +1017,9 @@ mod tests {
             "bar dir should be renamed to baz"
         );
         assert!(
-            entries.iter().any(|e| e.path == format!("{}/x.txt", new_prefix)),
+            entries
+                .iter()
+                .any(|e| e.path == format!("{}/x.txt", new_prefix)),
             "bar/x.txt should be renamed"
         );
 
@@ -1283,15 +1192,24 @@ mod tests {
     #[test]
     fn test_dirty_queue_insert_basic() {
         let mut q = DirtyQueue::new();
-        assert!(q.insert(PathBuf::from("/tmp/a.txt"), EventKind::Create(CreateKind::File)));
+        assert!(q.insert(
+            PathBuf::from("/tmp/a.txt"),
+            EventKind::Create(CreateKind::File)
+        ));
         assert_eq!(q.len(), 1);
     }
 
     #[test]
     fn test_dirty_queue_coalesce_same_path() {
         let mut q = DirtyQueue::new();
-        q.insert(PathBuf::from("/tmp/a.txt"), EventKind::Create(CreateKind::File));
-        q.insert(PathBuf::from("/tmp/a.txt"), EventKind::Modify(ModifyKind::Any));
+        q.insert(
+            PathBuf::from("/tmp/a.txt"),
+            EventKind::Create(CreateKind::File),
+        );
+        q.insert(
+            PathBuf::from("/tmp/a.txt"),
+            EventKind::Modify(ModifyKind::Any),
+        );
         // Same path should merge (still 1 entry, but with multiple event kinds)
         assert_eq!(q.len(), 1);
         let raw = q.take();
@@ -1318,7 +1236,10 @@ mod tests {
     fn test_dirty_queue_dir_clears_existing_children() {
         let mut q = DirtyQueue::new();
         // Insert child first
-        q.insert(PathBuf::from("/tmp/mydir/a.txt"), EventKind::Create(CreateKind::File));
+        q.insert(
+            PathBuf::from("/tmp/mydir/a.txt"),
+            EventKind::Create(CreateKind::File),
+        );
         assert_eq!(q.len(), 1);
         // Then insert parent dir → should remove child
         q.insert(
@@ -1334,7 +1255,10 @@ mod tests {
     #[test]
     fn test_dirty_queue_no_coalesce_sibling() {
         let mut q = DirtyQueue::new();
-        q.insert(PathBuf::from("/tmp/mydir"), EventKind::Create(CreateKind::Folder));
+        q.insert(
+            PathBuf::from("/tmp/mydir"),
+            EventKind::Create(CreateKind::Folder),
+        );
         // Sibling dir (different parent) should NOT be coalesced
         assert!(q.insert(
             PathBuf::from("/tmp/other"),
@@ -1346,7 +1270,10 @@ mod tests {
     #[test]
     fn test_dirty_queue_take_clears() {
         let mut q = DirtyQueue::new();
-        q.insert(PathBuf::from("/tmp/a.txt"), EventKind::Create(CreateKind::File));
+        q.insert(
+            PathBuf::from("/tmp/a.txt"),
+            EventKind::Create(CreateKind::File),
+        );
         assert_eq!(q.len(), 1);
         let raw = q.take();
         assert_eq!(raw.len(), 1);
@@ -1356,13 +1283,25 @@ mod tests {
     #[test]
     fn test_dirty_queue_max_batch_flush_semantics() {
         let mut q = DirtyQueue::new();
-        q.insert(PathBuf::from("/tmp/a.txt"), EventKind::Create(CreateKind::File));
-        q.insert(PathBuf::from("/tmp/b.txt"), EventKind::Create(CreateKind::File));
-        q.insert(PathBuf::from("/tmp/c.txt"), EventKind::Create(CreateKind::File));
+        q.insert(
+            PathBuf::from("/tmp/a.txt"),
+            EventKind::Create(CreateKind::File),
+        );
+        q.insert(
+            PathBuf::from("/tmp/b.txt"),
+            EventKind::Create(CreateKind::File),
+        );
+        q.insert(
+            PathBuf::from("/tmp/c.txt"),
+            EventKind::Create(CreateKind::File),
+        );
         assert_eq!(q.len(), 3);
         // Next insert triggers no auto-flush (caller decides),
         // but we can verify via len
-        q.insert(PathBuf::from("/tmp/d.txt"), EventKind::Create(CreateKind::File));
+        q.insert(
+            PathBuf::from("/tmp/d.txt"),
+            EventKind::Create(CreateKind::File),
+        );
         assert_eq!(q.len(), 4);
     }
 }

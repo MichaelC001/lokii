@@ -62,7 +62,7 @@ final class SearchWindow: NSWindowController {
 
     /// Tracks why the loading overlay is showing, so `onIndexReady` from
     /// a concurrent initialize/verify doesn't accidentally dismiss a rebuild overlay.
-    private enum IndexingState { case idle, initializing, rebuilding }
+    private enum IndexingState { case idle, initializing, rebuilding, failed }
     private var indexingState: IndexingState = .initializing
 
     // Main split: table scroll + info panel
@@ -633,11 +633,17 @@ final class SearchWindow: NSWindowController {
                        name: SearchEngine.indexUpdatedNotification, object: nil)
         nc.addObserver(self, selector: #selector(onStartupMode(_:)),
                        name: SearchEngine.startupModeNotification, object: nil)
+        nc.addObserver(self, selector: #selector(onInitializationFailed(_:)),
+                       name: SearchEngine.initializationFailedNotification, object: nil)
         nc.addObserver(self, selector: #selector(onConfigReloaded(_:)),
                        name: SearchEngine.configReloadedNotification, object: nil)
     }
 
     @objc private func onIndexProgress(_ note: Notification) {
+        guard indexingState != .failed else { return }
+        let phase = note.userInfo?["phase"] as? String ?? ""
+        guard phase != "verifying", indexingState != .idle else { return }
+        if indexingState == .initializing && !isColdStart { return }
         let source = note.userInfo?["source"] as? String ?? ""
         if indexingState == .rebuilding && source != "rebuild" { return }
         if indexingState == .initializing && source == "rebuild" { return }
@@ -660,6 +666,8 @@ final class SearchWindow: NSWindowController {
         let source = note.userInfo?["source"] as? String ?? ""
 
         switch indexingState {
+        case .failed:
+            return
         case .initializing:
             guard source != "rebuild" else {
                 statusLabel.stringValue = "\(formatCount(total)) indexed"
@@ -688,19 +696,45 @@ final class SearchWindow: NSWindowController {
     }
 
     @objc private func onIndexUpdated(_ note: Notification) {
+        guard indexingState != .failed else { return }
         let total = note.userInfo?["total"] as? UInt64 ?? 0
         statusLabel.stringValue = "\(formatCount(total)) indexed"
     }
 
     @objc private func onStartupMode(_ note: Notification) {
+        guard indexingState != .failed else { return }
         let coldStart = note.userInfo?["isColdStart"] as? Bool ?? true
         isColdStart = coldStart
         if coldStart {
             // Cold start — show overlay
             showLoadingOverlay(heading: L("search.buildingIndex"))
         } else {
-            // Hot start — show inline progress only
-            showInlineProgress()
+            statusLabel.stringValue = L("search.loadingIndex")
+        }
+    }
+
+    @objc private func onInitializationFailed(_ note: Notification) {
+        indexingState = .failed
+        searchWorkItem?.cancel()
+        loadingOverlay?.removeFromSuperview()
+        loadingOverlay = nil
+        overlayHeadingLabel = nil
+        overlaySubtextLabel = nil
+        overlayProgressIndicator?.stopAnimation(nil)
+        overlayProgressIndicator = nil
+        hideInlineProgress()
+        searchField.isEnabled = false
+        rebuildButton.isEnabled = false
+        statusLabel.stringValue = L("search.initializationFailed")
+
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = L("search.initializationFailed")
+        alert.informativeText = L("search.initializationFailedHelp") + "\n\n"
+            + (note.userInfo?["message"] as? String ?? "")
+        alert.addButton(withTitle: L("ok"))
+        if let window {
+            alert.beginSheetModal(for: window)
         }
     }
 
@@ -1125,6 +1159,7 @@ final class SearchWindow: NSWindowController {
     private var lastQuery: String = ""
 
     @objc private func searchChanged() {
+        guard indexingState != .failed else { return }
         let query = searchField.stringValue
         guard query != lastQuery else { return }
         lastQuery = query
@@ -1152,7 +1187,7 @@ final class SearchWindow: NSWindowController {
     private var isSearching = false
 
     private func performSearch(query: String) {
-        guard !isSearching else { return }
+        guard indexingState != .failed, !isSearching else { return }
         isSearching = true
         countLabel.stringValue = L("search.searching")
 
@@ -1162,6 +1197,7 @@ final class SearchWindow: NSWindowController {
             let response = self.engine.search(query: query, mode: mode)
             DispatchQueue.main.async {
                 self.isSearching = false
+                guard self.indexingState != .failed else { return }
                 self.results = response.results
                 self.iconCache.removeAll()
                 self.tableView.sortDescriptors = []  // Reset sort to relevance order (D-06)
