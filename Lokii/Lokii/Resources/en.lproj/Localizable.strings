@@ -124,6 +124,7 @@
 
 /* SearchWindow - status */
 "search.indexing" = "Indexing...";
+"search.loadingIndex" = "Loading index...";
 "search.indexingIncomplete" = "Indexing in progress, results may be incomplete";
 "search.backgroundRefresh" = "Background refresh in progress";
 "search.searching" = "Searching...";
@@ -215,3 +216,5 @@
 "force_use_shortcut" = "Use Anyway";
 "ok" = "OK";
 "space_key" = "Space";
+"search.initializationFailed" = "Index initialization failed";
+"search.initializationFailedHelp" = "Search is unavailable because the index could not be initialized. Restart Lokii to try again.";

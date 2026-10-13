@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::cache;
 use crate::config::{self, AppConfig, ConfigStore};
-use serde_json;
 use crate::indexer::IndexStore;
 use crate::metrics::WatcherMetrics;
 use crate::permissions;
@@ -65,6 +64,7 @@ pub enum FfiSearchMode {
 pub enum FfiStartupMode {
     HotStart { cached_count: u64 },
     ColdStart { scanned_count: u64 },
+    Failed { message: String },
 }
 
 // ── Callback Interface ──────────────────────────────────────────────────
@@ -175,15 +175,12 @@ impl LokiiCore {
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let poll_done = Arc::clone(&done);
 
-        std::thread::spawn(move || {
+        let poller = std::thread::spawn(move || {
             let phase = "scanning".to_string();
-            loop {
+            while !poll_done.load(Ordering::Relaxed) {
                 let count = poll_progress.load(Ordering::Relaxed);
                 poll_handler.on_index_progress(phase.clone(), count as u64);
-                if poll_done.load(Ordering::Relaxed) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::park_timeout(std::time::Duration::from_millis(50));
             }
         });
 
@@ -191,6 +188,25 @@ impl LokiiCore {
         let mode = startup::initialize_index(&self.store, &config, progress, &cache_file);
 
         done.store(true, Ordering::Relaxed);
+        poller.thread().unpark();
+        let _ = poller.join();
+        self.finish_initialization(mode, config, cache_file, event_handler)
+    }
+}
+
+impl LokiiCore {
+    fn finish_initialization(
+        &self,
+        mode: startup::StartupMode,
+        config: AppConfig,
+        cache_file: std::path::PathBuf,
+        event_handler: Arc<dyn EventHandler>,
+    ) -> FfiStartupMode {
+        if let startup::StartupMode::Failed(error) = mode {
+            return FfiStartupMode::Failed {
+                message: format!("Index initialization failed: {error}"),
+            };
+        }
         event_handler.on_index_ready(self.store.len() as u64);
 
         // For hot start, spawn background verification (non-blocking)
@@ -204,7 +220,12 @@ impl LokiiCore {
             std::thread::spawn(move || {
                 let _guard = verify_lock.lock().unwrap();
                 verify_handler.on_index_progress("verifying".to_string(), 0);
-                startup::verify_index(&store, &verify_config, &cache_file, &cancel);
+                if let Err(error) =
+                    startup::verify_index(&store, &verify_config, &cache_file, &cancel)
+                {
+                    verify_handler.on_watcher_error(format!("Index verification failed: {error}"));
+                    return;
+                }
                 // Only update if not cancelled (rebuild took over)
                 if !cancel.load(Ordering::Relaxed) {
                     verify_handler.on_index_updated(store.len() as u64);
@@ -213,19 +234,19 @@ impl LokiiCore {
         }
 
         match mode {
-            startup::StartupMode::HotStart { cached_count } => {
-                FfiStartupMode::HotStart {
-                    cached_count: cached_count as u64,
-                }
-            }
-            startup::StartupMode::ColdStart { scanned_count } => {
-                FfiStartupMode::ColdStart {
-                    scanned_count: scanned_count as u64,
-                }
-            }
+            startup::StartupMode::HotStart { cached_count } => FfiStartupMode::HotStart {
+                cached_count: cached_count as u64,
+            },
+            startup::StartupMode::ColdStart { scanned_count } => FfiStartupMode::ColdStart {
+                scanned_count: scanned_count as u64,
+            },
+            startup::StartupMode::Failed(_) => unreachable!("failed startup returned before ready"),
         }
     }
+}
 
+#[uniffi::export]
+impl LokiiCore {
     /// Start the file system watcher. Calls event_handler.on_index_updated
     /// whenever the index changes. Non-blocking (spawns a thread internally).
     pub fn start_watcher(&self, event_handler: Arc<dyn EventHandler>) {
@@ -233,9 +254,14 @@ impl LokiiCore {
         let handler = Arc::clone(&event_handler);
         let metrics = Arc::clone(&self.metrics);
 
-        if let Err(e) = watcher::start_watcher(self.store.clone(), config.clone(), metrics, move |new_total| {
-            handler.on_index_updated(new_total as u64);
-        }) {
+        if let Err(e) = watcher::start_watcher(
+            self.store.clone(),
+            config.clone(),
+            metrics,
+            move |new_total| {
+                handler.on_index_updated(new_total as u64);
+            },
+        ) {
             event_handler.on_watcher_error(format!("{e}"));
         }
 
@@ -339,20 +365,24 @@ impl LokiiCore {
         let paths = config.resolve_paths();
 
         let filter = Arc::new(crate::filter::CompiledFilter::from_config(&config));
-        let fresh = scanner::scan_directories(
-            &paths,
-            filter,
-            config.index.include_hidden,
-            progress,
-        );
+        let fresh =
+            match scanner::scan_compact(&paths, filter, config.index.include_hidden, progress) {
+                Ok(fresh) => fresh,
+                Err(error) => {
+                    done.store(true, Ordering::Relaxed);
+                    event_handler.on_watcher_error(format!("Index rebuild failed: {error}"));
+                    return false;
+                }
+            };
 
         done.store(true, Ordering::Relaxed);
-        self.store.replace(fresh);
 
-        // Save cache
+        // Save cache before publishing the index: encoding a multi-million
+        // entry index must not happen while holding the store lock.
         let cache_file = AppConfig::config_dir().join("index.cache");
-        let entries = self.store.entries();
-        let _ = cache::save_cache(&entries, &cache_file);
+        let _ = cache::save_compact(&fresh, &cache_file);
+
+        self.store.replace_compact(fresh);
 
         drop(guard);
         event_handler.on_index_ready(self.store.len() as u64);
@@ -386,9 +416,8 @@ impl LokiiCore {
     /// Get the current configuration as a JSON string.
     pub fn get_config_json(&self) -> String {
         let config = self.config_store.read();
-        serde_json::to_string_pretty(&*config).unwrap_or_else(|_| {
-            serde_json::to_string_pretty(&AppConfig::default()).unwrap()
-        })
+        serde_json::to_string_pretty(&*config)
+            .unwrap_or_else(|_| serde_json::to_string_pretty(&AppConfig::default()).unwrap())
     }
 
     /// Get watcher diagnostic metrics as a JSON string.
@@ -425,5 +454,92 @@ impl LokiiCore {
         // Sync memory directly (don't wait for file watcher)
         self.config_store.update(new_config);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compact_index::IndexError;
+
+    #[derive(Default)]
+    struct RecordingHandler {
+        events: Mutex<Vec<String>>,
+    }
+
+    impl EventHandler for RecordingHandler {
+        fn on_index_progress(&self, phase: String, scanned_files: u64) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("{phase}:{scanned_files}"));
+        }
+
+        fn on_index_ready(&self, total: u64) {
+            self.events.lock().unwrap().push(format!("ready:{total}"));
+        }
+
+        fn on_index_updated(&self, new_total: u64) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("updated:{new_total}"));
+        }
+
+        fn on_watcher_error(&self, msg: String) {
+            self.events.lock().unwrap().push(msg);
+        }
+
+        fn on_config_reloaded(&self) {}
+    }
+
+    fn core() -> LokiiCore {
+        LokiiCore {
+            store: IndexStore::new(),
+            config_store: ConfigStore::new(AppConfig::default()),
+            cancel_verify: Arc::new(AtomicBool::new(true)),
+            scan_lock: Arc::new(Mutex::new(())),
+            metrics: Arc::new(WatcherMetrics::new()),
+        }
+    }
+
+    #[test]
+    fn initialization_failure_returns_error_without_ready_or_verification() {
+        for error in [IndexError::IdOverflow, IndexError::ReferenceOverflow] {
+            let core = core();
+            let handler = Arc::new(RecordingHandler::default());
+            let directory = tempfile::tempdir().unwrap();
+            let result = core.finish_initialization(
+                startup::StartupMode::Failed(error),
+                AppConfig::default(),
+                directory.path().join("index.cache"),
+                handler.clone(),
+            );
+            let FfiStartupMode::Failed { message } = result else {
+                panic!("failed initialization must not report a successful startup");
+            };
+            assert_eq!(message, format!("Index initialization failed: {error}"));
+            assert!(handler.events.lock().unwrap().is_empty());
+            assert!(core.cancel_verify.load(Ordering::Relaxed));
+            assert!(core.store.is_empty());
+        }
+    }
+
+    #[test]
+    fn empty_cold_start_is_success_and_still_reports_ready() {
+        let core = core();
+        let handler = Arc::new(RecordingHandler::default());
+        let directory = tempfile::tempdir().unwrap();
+        let result = core.finish_initialization(
+            startup::StartupMode::ColdStart { scanned_count: 0 },
+            AppConfig::default(),
+            directory.path().join("index.cache"),
+            handler.clone(),
+        );
+        assert!(matches!(
+            result,
+            FfiStartupMode::ColdStart { scanned_count: 0 }
+        ));
+        assert_eq!(*handler.events.lock().unwrap(), ["ready:0"]);
     }
 }

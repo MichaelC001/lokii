@@ -66,6 +66,7 @@ final class SearchEngine: @unchecked Sendable {
     static let indexUpdatedNotification = Notification.Name("LokiiIndexUpdated")
     /// Posted on main thread after initialize() determines startup mode. userInfo: ["isColdStart": Bool]
     static let startupModeNotification = Notification.Name("LokiiStartupMode")
+    static let initializationFailedNotification = Notification.Name("LokiiInitializationFailed")
     /// Posted on main thread when config.toml is reloaded.
     static let configReloadedNotification = Notification.Name("LokiiConfigReloaded")
 
@@ -107,6 +108,15 @@ final class SearchEngine: @unchecked Sendable {
                 print("[Lokii] Hot start: \(cachedCount) cached entries")
             case let .coldStart(scannedCount):
                 print("[Lokii] Cold start: scanned \(scannedCount) entries")
+            case let .failed(message):
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(
+                        name: SearchEngine.initializationFailedNotification,
+                        object: nil,
+                        userInfo: ["message": message]
+                    )
+                }
+                return
             }
             core.startWatcher(eventHandler: handler)
             core.startConfigWatcher(eventHandler: handler)
