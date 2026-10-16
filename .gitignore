@@ -17,6 +17,8 @@ output/
 *.dmg.tmp
 *.iconset/
 
+docs/
+
 # Xcode 用户状态与工作空间缓存
 xcuserdata/
 *.xcworkspace/xcuserdata/
