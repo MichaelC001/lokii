@@ -147,7 +147,7 @@ jobs:
     needs: release
     runs-on: macos-15
     permissions:
-      contents: read
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -177,7 +177,7 @@ jobs:
             elif [ "$STATUS" != 200 ]; then
               exit 1
             fi
-            gh release view "$GITHUB_REF_NAME" --json body --jq .body > "output/Lokii-${GITHUB_REF_NAME#v}-$ARCH.md"
+            gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --json body --jq .body > "output/Lokii-${GITHUB_REF_NAME#v}-$ARCH.md"
           done
           LOKII_UPDATE_PRIVATE_KEY_FILE="$KEY_FILE" bash scripts/publish-update-feed.sh "${GITHUB_REF_NAME#v}" output feeds/updates
       - uses: actions/upload-artifact@v4
