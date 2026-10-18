@@ -26,7 +26,7 @@ final class FDAGuideWindowController: NSWindowController, NSWindowDelegate {
 
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 380, height: 154),
+            contentRect: NSRect(x: 0, y: 0, width: 410, height: 166),
             styleMask: [.titled, .closable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -38,6 +38,10 @@ final class FDAGuideWindowController: NSWindowController, NSWindowDelegate {
         window.titlebarAppearsTransparent = true
         window.level = .floating
         window.center()
+
+        // 隐藏不适用的最小化与缩放按钮，保持轻量弹窗整洁外观
+        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        window.standardWindowButton(.zoomButton)?.isHidden = true
 
         super.init(window: window)
         window.delegate = self

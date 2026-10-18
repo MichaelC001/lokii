@@ -31,9 +31,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainWindow = SearchWindow(engine: engine)
         mainWindow?.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
-        checkAndPromptFDA()
-
         engine.initialize()
+
+        // 热启动直接就绪场景下，延迟 0.3 秒主动弹出授权提醒浮窗
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.checkAndPromptFDA()
+        }
 
         AppUpdater.shared.start()
     }
@@ -48,6 +51,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidResignActive(_ notification: Notification) {
+        if mainWindow?.isGuidingOnboarding == true || FDAGuideWindowController.current?.window?.isVisible == true {
+            return
+        }
         guard engine.getConfig()?.window.hideOnBlur ?? true else { return }
         mainWindow?.window?.orderOut(nil)
     }
@@ -103,9 +109,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Full Disk Access
 
-    private func checkAndPromptFDA() {
+    func checkAndPromptFDA() {
         guard !clearFDAPromptIfGranted() else { return }
         guard !UserDefaults.standard.bool(forKey: FDAGuideWindowController.promptDismissedKey) else { return }
+        // 若主窗口处于冷启动全屏建库遮罩状态，暂不弹出，待索引就绪遮罩收起后再弹出
+        if mainWindow?.isOverlayVisible == true {
+            return
+        }
         FDAGuideWindowController.show()
     }
 

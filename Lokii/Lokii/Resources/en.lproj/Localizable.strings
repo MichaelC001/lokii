@@ -138,6 +138,7 @@
 "search.buildingIndex" = "Building Index...";
 "search.scanningFiles" = "Scanning files...";
 "search.scannedCount" = "Scanned %@ files";
+"search.scannedFilesLabel" = "Scanned files";
 "search.indexingCount" = "Indexing %@ files...";
 "search.indexedCount" = "%@ files indexed";
 "search.matchedCount" = "%@ matches";
@@ -193,6 +194,7 @@
 "fda.dontShowAgain" = "Don't show again";
 "fda.later" = "Later";
 "fda.openSystemSettings" = "Open System Settings";
+"fda.restrictedHint" = "Full Disk Access restricted · View guide ↗";
 
 /* Preferences - About & Group Titles */
 "prefs.tab.about" = "About";

@@ -472,7 +472,37 @@ assertEqual(controller.currentFontSize, 13, "当前生效字号应恢复为 13 p
 assertEqual(controller.tableView.rowHeight, 24, "标准模式行高应为 24 pt")
 assertEqual(controller.currentIconSize, 16, "标准模式图标尺寸应为 16 pt")
 
-print("测试全部通过：10/10 项断言成功。")
+print("[11/11] 测试完全磁盘访问权限受限提示与底栏路径让位互斥逻辑 (updateFDAStatus & updateBottomPath)...")
+// 1. 模拟未获得完全磁盘访问权限，未选中文件时应呈现提示按钮并隐藏路径栏
+controller.updateFDAStatus(hasFDA: false)
+controller.updateBottomPath(with: nil)
+assertEqual(controller.fdaHintButton.isHidden, false, "未获得 FDA 权限且无选中文件时应展示受限提示按钮")
+assertEqual(controller.pathBar.isHidden, true, "未获得 FDA 权限且无选中文件时应隐藏路径栏")
+
+// 2. 选中具体文件时，路径展示优先，受限提示应主动让位隐藏
+controller.updateBottomPath(with: "/System/Library/CoreServices/Finder.app")
+assertEqual(controller.pathBar.isHidden, false, "选中具体文件时路径栏应正常展示")
+assertEqual(controller.fdaHintButton.isHidden, true, "选中具体文件时受限提示应让位隐藏")
+
+// 3. 取消文件选中后，应重新恢复展示受限提示
+controller.updateBottomPath(with: nil)
+assertEqual(controller.fdaHintButton.isHidden, false, "取消文件选中后应恢复展示受限提示按钮")
+assertEqual(controller.pathBar.isHidden, true, "取消文件选中后路径栏应隐藏")
+
+// 4. 授权成功后，受限提示应静默隐藏
+controller.updateFDAStatus(hasFDA: true)
+assertEqual(controller.fdaHintButton.isHidden, true, "完全磁盘访问权限授予后应静默隐藏受限提示按钮")
+assertEqual(controller.pathBar.isHidden, false, "完全磁盘访问权限授予后路径栏应恢复可用")
+
+// 5. 点击受限提示按钮时触发引导回调闭包
+var fdaGuideTriggered = false
+controller.onOpenFDAGuide = { fdaGuideTriggered = true }
+if let action = controller.fdaHintButton.action {
+    _ = controller.fdaHintButton.target?.perform(action, with: controller.fdaHintButton)
+}
+assertEqual(fdaGuideTriggered, true, "点击受限提示按钮应成功触发引导回调闭包")
+
+print("测试全部通过：11/11 项断言成功。")
 """
 
 let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

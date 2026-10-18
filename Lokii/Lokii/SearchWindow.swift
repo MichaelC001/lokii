@@ -1,12 +1,25 @@
 import AppKit
 import UniformTypeIdentifiers
 import Quartz
+import SwiftUI
 
-/// Blocks all mouse and keyboard events so the UI beneath is not interactive.
-private final class EventBlockingView: NSView {
+/// Container view that intercepts clicks outside interactiveCardView while routing clicks inside to the card.
+private final class OverlayContainerView: NSView {
+    weak var interactiveCardView: NSView?
+
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func hitTest(_ point: NSPoint) -> NSView? { self }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        if let card = interactiveCardView {
+            let pointInCard = card.convert(point, from: self)
+            if card.bounds.contains(pointInCard), let hitView = card.hitTest(pointInCard) {
+                return hitView
+            }
+        }
+        return self
+    }
+
     override func mouseDown(with event: NSEvent) {}
     override func mouseUp(with event: NSEvent) {}
     override func keyDown(with event: NSEvent) {}
@@ -52,19 +65,26 @@ final class SearchWindow: NSWindowController {
         didSet { updateStatusLabel() }
     }
     private var overlaySubtext: LocalizedText = .key("search.scanningFiles") {
-        didSet { overlaySubtextLabel?.stringValue = overlaySubtext.string }
+        didSet { overlayState?.statusText = overlaySubtext.string }
     }
     private weak var refreshToastLabel: NSTextField?
 
     // Loading overlay
     private var loadingOverlay: NSView?
-    private var overlayHeadingLabel: NSTextField?
-    private var overlaySubtextLabel: NSTextField?
+    private var overlayState: IndexingOverlayState?
     private var overlayShownAt: Date?
     private var isColdStart: Bool = true  // Default true until startup mode known
-    private var overlayProgressIndicator: NSProgressIndicator?
     private var isInlineProgressActive: Bool = false
+    private var lastOverlayProgressUpdate: TimeInterval = 0
     private var originalSearchPlaceholder: String { L("search.placeholder") }
+
+    var isGuidingOnboarding: Bool {
+        FDAGuideWindowController.current?.window?.isVisible == true
+    }
+
+    var isOverlayVisible: Bool {
+        loadingOverlay != nil
+    }
 
     /// Tracks why the loading overlay is showing, so `onIndexReady` from
     /// a concurrent initialize/verify doesn't accidentally dismiss a rebuild overlay.
@@ -118,6 +138,10 @@ final class SearchWindow: NSWindowController {
         setupNotifications()
         onLanguageChanged()
 
+        searchResultsViewController.onOpenFDAGuide = {
+            FDAGuideWindowController.show()
+        }
+        searchResultsViewController.updateFDAStatus(hasFDA: engine.hasFullDiskAccess)
         if engine.stats.isReady {
             loadDefaultResults()
         }
@@ -293,6 +317,18 @@ final class SearchWindow: NSWindowController {
                        name: SearchEngine.initializationFailedNotification, object: nil)
         nc.addObserver(self, selector: #selector(onConfigReloaded(_:)),
                        name: SearchEngine.configReloadedNotification, object: nil)
+        nc.addObserver(self, selector: #selector(onAppDidBecomeActive),
+                       name: NSApplication.didBecomeActiveNotification, object: nil)
+    }
+
+    @objc private func onAppDidBecomeActive() {
+        let hasFDA = engine.hasFullDiskAccess
+        searchResultsViewController.updateFDAStatus(hasFDA: hasFDA)
+        guard let state = overlayState else { return }
+        state.syncDismissedState()
+        if hasFDA {
+            state.markFDAGranted()
+        }
     }
 
     @objc private func onLanguageChanged() {
@@ -323,8 +359,8 @@ final class SearchWindow: NSWindowController {
             menu.refreshLocalizedTitles()
         }
         updateStatusLabel()
-        overlayHeadingLabel?.stringValue = L("search.buildingIndex")
-        overlaySubtextLabel?.stringValue = overlaySubtext.string
+        overlayState?.headingText = L("search.buildingIndex")
+        overlayState?.statusText = overlaySubtext.string
         refreshToastLabel?.stringValue = L("search.backgroundRefresh")
     }
 
@@ -354,9 +390,15 @@ final class SearchWindow: NSWindowController {
         let formatted = formatCount(count)
 
         statusText = .formatted("search.indexingCount", formatted)
-        // 冷启动期间额外把扫描计数同步到遮罩副标题
+        // 冷启动期间额外把扫描计数同步到遮罩副标题与一体化卡片状态
         if isColdStart && indexingState == .initializing {
             overlaySubtext = .formatted("search.scannedCount", formatted)
+            let now = CACurrentMediaTime()
+            if now - lastOverlayProgressUpdate > 0.033 {
+                lastOverlayProgressUpdate = now
+                overlayState?.scannedCount = count
+                overlayState?.statusText = L("search.scanningFiles")
+            }
         }
     }
 
@@ -383,11 +425,15 @@ final class SearchWindow: NSWindowController {
         // 冷启动以全窗遮罩呈现进度，热启动与重建以内联指示器呈现，故收起方式不同
         if indexingState == .initializing && isColdStart {
             hideLoadingOverlay()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                (NSApp.delegate as? AppDelegate)?.checkAndPromptFDA()
+            }
         } else {
             hideInlineProgress()
         }
         searchResultsViewController.setRebuildSpinning(false)
         searchResultsViewController.setRebuildEnabled(true)
+        searchResultsViewController.updateFDAStatus(hasFDA: engine.hasFullDiskAccess)
         indexingState = .idle
         if searchField.stringValue.isEmpty {
             loadDefaultResults()
@@ -398,6 +444,7 @@ final class SearchWindow: NSWindowController {
         guard indexingState != .failed else { return }
         let total = note.userInfo?["total"] as? UInt64 ?? 0
         statusText = .formatted("search.indexedCount", formatCount(total))
+        overlayState?.scannedCount = total
     }
 
     @objc private func onStartupMode(_ note: Notification) {
@@ -417,10 +464,7 @@ final class SearchWindow: NSWindowController {
         searchWorkItem?.cancel()
         loadingOverlay?.removeFromSuperview()
         loadingOverlay = nil
-        overlayHeadingLabel = nil
-        overlaySubtextLabel = nil
-        overlayProgressIndicator?.stopAnimation(nil)
-        overlayProgressIndicator = nil
+        overlayState = nil
         hideInlineProgress()
         searchField.isEnabled = false
         searchResultsViewController.setRebuildEnabled(false)
@@ -506,93 +550,44 @@ final class SearchWindow: NSWindowController {
     private func showLoadingOverlay(heading: String) {
         searchField.isEnabled = false
         guard loadingOverlay == nil else {
-            overlayHeadingLabel?.stringValue = heading
+            overlayState?.headingText = heading
             return
         }
         overlayShownAt = Date()
         overlaySubtext = .key("search.scanningFiles")
         guard let contentView = window?.contentView else { return }
 
-        // Full-window event-blocking overlay
-        let overlay = EventBlockingView(frame: contentView.bounds)
+        let hasFDA = engine.hasFullDiskAccess
+        let promptDismissed = UserDefaults.standard.bool(forKey: FDAGuideWindowController.promptDismissedKey)
+        let state = IndexingOverlayState(
+            hasFDA: hasFDA,
+            promptDismissed: promptDismissed,
+            isColdStart: isColdStart,
+            heading: heading
+        )
+        self.overlayState = state
+
+        // Full-window overlay container with selective hit-testing
+        let overlay = OverlayContainerView(frame: contentView.bounds)
         overlay.autoresizingMask = [.width, .height]
         overlay.wantsLayer = true
         overlay.alphaValue = 0
         contentView.addSubview(overlay)
         loadingOverlay = overlay
 
-        // Frosted glass background (per D-02: full-window blur)
-        let blurView = NSVisualEffectView(frame: overlay.bounds)
-        blurView.autoresizingMask = [.width, .height]
-        blurView.material = .underWindowBackground
-        blurView.blendingMode = .behindWindow
-        blurView.state = .active
-        overlay.addSubview(blurView)
+        // Fullscreen indexing overlay with center animation & bottom-trailing pill
+        let cardView = IndexingFullScreenOverlayView(state: state)
+        let hostingView = NSHostingView(rootView: cardView)
+        hostingView.translatesAutoresizingMaskIntoConstraints = false
+        hostingView.wantsLayer = true
+        overlay.addSubview(hostingView)
+        overlay.interactiveCardView = hostingView
 
-        // Center card (per D-03)
-        let card = NSView()
-        card.translatesAutoresizingMaskIntoConstraints = false
-        overlay.addSubview(card)
-
-        // Magnifying glass icon — STATIC, no pulse animation (per D-03)
-        let iconConfig = NSImage.SymbolConfiguration(pointSize: 40, weight: .light)
-        let iconImage = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: "Indexing")!
-            .withSymbolConfiguration(iconConfig)!
-        let iconView = NSImageView(image: iconImage)
-        iconView.translatesAutoresizingMaskIntoConstraints = false
-        iconView.contentTintColor = .secondaryLabelColor
-        card.addSubview(iconView)
-
-        // Indeterminate progress bar (per D-04)
-        let progressBar = NSProgressIndicator()
-        progressBar.translatesAutoresizingMaskIntoConstraints = false
-        progressBar.style = .bar
-        progressBar.isIndeterminate = true
-        progressBar.startAnimation(nil)
-        card.addSubview(progressBar)
-        overlayProgressIndicator = progressBar
-
-        // Heading label: "Building Index..."
-        let headingLabel = NSTextField(labelWithString: heading)
-        headingLabel.translatesAutoresizingMaskIntoConstraints = false
-        headingLabel.font = .systemFont(ofSize: 16, weight: .semibold)
-        headingLabel.textColor = .labelColor
-        headingLabel.alignment = .center
-        card.addSubview(headingLabel)
-        overlayHeadingLabel = headingLabel
-
-        // Subtext: live file count
-        let subtextLabel = NSTextField(labelWithString: L("search.scanningFiles"))
-        subtextLabel.translatesAutoresizingMaskIntoConstraints = false
-        subtextLabel.font = .systemFont(ofSize: 13, weight: .regular)
-        subtextLabel.textColor = .secondaryLabelColor
-        subtextLabel.alignment = .center
-        card.addSubview(subtextLabel)
-        overlaySubtextLabel = subtextLabel
-
-        // Layout
         NSLayoutConstraint.activate([
-            card.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
-            card.centerYAnchor.constraint(equalTo: overlay.centerYAnchor),
-            card.widthAnchor.constraint(equalToConstant: 260),
-
-            iconView.topAnchor.constraint(equalTo: card.topAnchor, constant: 24),
-            iconView.centerXAnchor.constraint(equalTo: card.centerXAnchor),
-            iconView.widthAnchor.constraint(equalToConstant: 48),
-            iconView.heightAnchor.constraint(equalToConstant: 48),
-
-            progressBar.topAnchor.constraint(equalTo: iconView.bottomAnchor, constant: 20),
-            progressBar.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 24),
-            progressBar.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -24),
-
-            headingLabel.topAnchor.constraint(equalTo: progressBar.bottomAnchor, constant: 16),
-            headingLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
-            headingLabel.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -16),
-
-            subtextLabel.topAnchor.constraint(equalTo: headingLabel.bottomAnchor, constant: 4),
-            subtextLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
-            subtextLabel.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -16),
-            subtextLabel.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -24),
+            hostingView.leadingAnchor.constraint(equalTo: overlay.leadingAnchor),
+            hostingView.trailingAnchor.constraint(equalTo: overlay.trailingAnchor),
+            hostingView.topAnchor.constraint(equalTo: overlay.topAnchor),
+            hostingView.bottomAnchor.constraint(equalTo: overlay.bottomAnchor),
         ])
 
         // Fade in
@@ -632,9 +627,7 @@ final class SearchWindow: NSWindowController {
         }, completionHandler: { [weak self] in
             overlay.removeFromSuperview()
             self?.loadingOverlay = nil
-            self?.overlayHeadingLabel = nil
-            self?.overlaySubtextLabel = nil
-            self?.overlayProgressIndicator = nil
+            self?.overlayState = nil
         })
     }
 

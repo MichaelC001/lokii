@@ -138,6 +138,7 @@
 "search.buildingIndex" = "正在构建索引...";
 "search.scanningFiles" = "正在扫描文件...";
 "search.scannedCount" = "已扫描 %@ 个文件";
+"search.scannedFilesLabel" = "已扫描文件";
 "search.indexingCount" = "正在索引 %@ 个文件...";
 "search.indexedCount" = "已索引 %@ 个文件";
 "search.matchedCount" = "已匹配 %@ 项";
@@ -193,6 +194,7 @@
 "fda.dontShowAgain" = "不再提示";
 "fda.later" = "稍后";
 "fda.openSystemSettings" = "打开系统设置";
+"fda.restrictedHint" = "完全磁盘访问受限 · 查看指引 ↗";
 
 /* Preferences - About & Group Titles */
 "prefs.tab.about" = "关于";

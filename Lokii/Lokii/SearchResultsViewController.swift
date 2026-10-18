@@ -15,6 +15,14 @@ final class SearchResultsCenterSpinContainerView: NSView {
     }
 }
 
+/// 底栏克制权限提示按钮：提供原生手型指针交互响应
+private final class InteractiveHintButton: NSButton {
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+}
+
 extension CALayer {
     /// 追加匀速无限旋转；AppKit 图层坐标系中逆时针为正，故顺时针取负值
     func addInfiniteSpin() {
@@ -125,12 +133,15 @@ protocol SearchResultsViewControllerDelegate: AnyObject {
     func searchResultsDidRequestFocusSearchField()
     /// 检索结果条目成功移入废纸篓回调（用于联动上层容器与目录聚合树同步）
     func searchResultsDidTrashItems(paths: Set<String>)
+    /// 触发完全磁盘访问指引交互回调
+    func searchResultsDidRequestFDAGuide()
 }
 
 extension SearchResultsViewControllerDelegate {
     func searchResultsDidRequestRebuild() {}
     func searchResultsDidRequestFocusSearchField() {}
     func searchResultsDidTrashItems(paths: Set<String>) {}
+    func searchResultsDidRequestFDAGuide() {}
 }
 
 // MARK: - SearchResultsViewController
@@ -163,6 +174,10 @@ final class SearchResultsViewController: NSViewController {
     }()
     let rebuildContainer = SearchResultsCenterSpinContainerView()
     let rebuildButton = NSButton()
+    let fdaHintButton: NSButton = InteractiveHintButton()
+    private var hasFullDiskAccess: Bool = true
+    /// 完全磁盘访问受限指引点击回调
+    var onOpenFDAGuide: (() -> Void)?
 
     private(set) var results: [FfiSearchResult] = []
     private let iconCache: NSCache<NSString, NSImage> = {
@@ -270,6 +285,20 @@ final class SearchResultsViewController: NSViewController {
         pathBar.setContentHuggingPriority(.defaultLow, for: .horizontal)
         bottomBar.addSubview(pathBar)
 
+        fdaHintButton.translatesAutoresizingMaskIntoConstraints = false
+        fdaHintButton.isBordered = false
+        fdaHintButton.bezelStyle = .inline
+        fdaHintButton.setButtonType(.momentaryPushIn)
+        fdaHintButton.focusRingType = .none
+        fdaHintButton.refusesFirstResponder = true
+        fdaHintButton.target = self
+        fdaHintButton.action = #selector(fdaHintButtonClicked)
+        fdaHintButton.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        fdaHintButton.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        fdaHintButton.isHidden = true
+        updateFDAButtonContent()
+        bottomBar.addSubview(fdaHintButton)
+
         bottomBar.addSubview(inlineProgressIndicator)
 
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -300,6 +329,10 @@ final class SearchResultsViewController: NSViewController {
             pathBar.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
             pathBar.trailingAnchor.constraint(lessThanOrEqualTo: inlineProgressIndicator.leadingAnchor, constant: -8),
 
+            fdaHintButton.leadingAnchor.constraint(equalTo: bottomBar.leadingAnchor, constant: 14),
+            fdaHintButton.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
+            fdaHintButton.trailingAnchor.constraint(lessThanOrEqualTo: inlineProgressIndicator.leadingAnchor, constant: -8),
+
             inlineProgressIndicator.trailingAnchor.constraint(equalTo: statusLabel.leadingAnchor, constant: -4),
             inlineProgressIndicator.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
             inlineProgressIndicator.widthAnchor.constraint(equalToConstant: 16),
@@ -313,6 +346,8 @@ final class SearchResultsViewController: NSViewController {
             rebuildContainer.widthAnchor.constraint(equalToConstant: 20),
             rebuildContainer.heightAnchor.constraint(equalToConstant: 20),
         ])
+
+        updateBottomBarVisibility()
     }
 
     override func viewDidLoad() {
@@ -503,9 +538,34 @@ final class SearchResultsViewController: NSViewController {
 
     // MARK: - Bottom Bar Interface
 
-    /// 更新底栏文件路径展示
+    /// 更新底栏文件路径展示并协同控制与权限提示的互斥显隐
     func updateBottomPath(with path: String?) {
         pathBar.url = path.map { URL(fileURLWithPath: $0) }
+        updateBottomBarVisibility()
+    }
+
+    /// 更新当前完全磁盘访问权限状态并刷新底栏互斥展示
+    func updateFDAStatus(hasFDA: Bool) {
+        guard self.hasFullDiskAccess != hasFDA else { return }
+        self.hasFullDiskAccess = hasFDA
+        updateBottomBarVisibility()
+    }
+
+    /// 根据当前路径选中状态与完全磁盘访问权限协同控制显隐让位
+    private func updateBottomBarVisibility() {
+        let hasPath = pathBar.url != nil
+        if hasPath {
+            pathBar.isHidden = false
+            fdaHintButton.isHidden = true
+        } else {
+            if !hasFullDiskAccess {
+                pathBar.isHidden = true
+                fdaHintButton.isHidden = false
+            } else {
+                pathBar.isHidden = false
+                fdaHintButton.isHidden = true
+            }
+        }
     }
 
     /// 更新底栏状态统计文本
@@ -557,9 +617,43 @@ final class SearchResultsViewController: NSViewController {
         tableView.reloadData()
         rebuildButton.toolTip = L("search.rebuildIndex")
         rebuildButton.setAccessibilityLabel(L("search.rebuildIndex"))
+        updateFDAButtonContent()
     }
 
     // MARK: - Bottom Bar Actions & Animation
+
+    @objc private func fdaHintButtonClicked() {
+        if let onOpenFDAGuide {
+            onOpenFDAGuide()
+        } else {
+            delegate?.searchResultsDidRequestFDAGuide()
+        }
+    }
+
+    private func updateFDAButtonContent() {
+        let font = NSFont.systemFont(ofSize: 11.5, weight: .regular)
+        let config = NSImage.SymbolConfiguration(pointSize: 11, weight: .medium)
+            .applying(.init(paletteColors: [.systemOrange]))
+        let image = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: nil)?
+            .withSymbolConfiguration(config)
+
+        fdaHintButton.image = image
+        fdaHintButton.imagePosition = .imageLeading
+        fdaHintButton.imageHugsTitle = true
+
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.lineBreakMode = .byTruncatingTail
+
+        let attributedTitle = NSAttributedString(
+            string: " " + L("fda.restrictedHint"),
+            attributes: [
+                .font: font,
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: paragraphStyle,
+            ]
+        )
+        fdaHintButton.attributedTitle = attributedTitle
+    }
 
     @objc private func pathBarClicked() {
         if let url = pathBar.clickedPathItem?.url ?? pathBar.url {
